@@ -8,6 +8,7 @@ use tracing::info;
 mod router;
 mod s3_handler;
 mod xml_writer;
+mod credentials;
 
 #[tokio::main]
 async fn main() {

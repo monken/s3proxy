@@ -1,7 +1,6 @@
-use aws_config;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::SdkBody;
-use aws_sdk_s3::{Client, Config, Error};
+use aws_sdk_s3::{config::Region, Client, Config, Error};
 use bytes::BytesMut;
 use futures_util::TryFutureExt;
 use http::HeaderValue;
@@ -15,29 +14,27 @@ use tokio::try_join;
 use tokio_util::io::ReaderStream;
 use tracing::{info, instrument};
 
+use crate::credentials::{CredentialsError, CredentialsManager};
 use crate::xml_writer::list_bucket_objects_to_xml;
 
 pub struct S3Handler {
-    client: Client,
+    config: Config,
+    credentials: CredentialsManager,
     size_cache: RwLock<std::collections::HashMap<String, i64>>,
 }
 
 impl S3Handler {
     pub async fn new() -> Result<Self, Error> {
-        let config = aws_config::from_env()
-            .region("foundry")
+        let s3config = Config::builder()
+            .region(Region::new("foundry"))
             .endpoint_url("https://ecosystem.athinia.com/io/s3/")
-            .load()
-            .await;
-        let s3config = Config::from(&config)
-            .to_builder()
             .force_path_style(true)
             .build();
-        let client = Client::from_conf(s3config);
         let size_cache = std::collections::HashMap::new();
         Ok(S3Handler {
-            client,
+            config: s3config,
             size_cache: RwLock::new(size_cache),
+            credentials: CredentialsManager::new(),
         })
     }
 
@@ -53,9 +50,32 @@ impl S3Handler {
             .unwrap())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
+    pub async fn get_client(&self, token: &str) -> Result<Client, CredentialsError> {
+        let credentials = self.credentials.get_credentials(token.to_string()).await?;
+        let aws_credentials = aws_sdk_s3::config::SharedCredentialsProvider::new(
+            aws_sdk_s3::config::Credentials::new(
+                credentials.access_key_id,
+                credentials.secret_access_key,
+                Some(credentials.session_token),
+                None,
+                "PLTR",
+            ),
+        );
+        let client = Client::from_conf(
+            self.config
+                .to_builder()
+                .set_credentials_provider(Some(aws_credentials))
+                .clone()
+                .build(),
+        );
+        Ok(client)
+    }
+
+    #[instrument(skip(self, client))]
     pub async fn head_object(
         &self,
+        client: &Client,
         bucket: &str,
         key: &str,
     ) -> Result<Response<Body>, hyper::Error> {
@@ -72,13 +92,7 @@ impl S3Handler {
                 None => {}
             }
         }
-        let resp = self
-            .client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await;
+        let resp = client.head_object().bucket(bucket).key(key).send().await;
         match resp {
             Ok(obj) => {
                 self.size_cache
@@ -102,9 +116,10 @@ impl S3Handler {
         format!("{:x}", result)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, client))]
     pub async fn get_object(
         &self,
+        client: &Client,
         bucket: &str,
         key: &str,
         range: Option<&HeaderValue>,
@@ -124,7 +139,7 @@ impl S3Handler {
 
         let (sender, body) = hyper::Body::channel();
 
-        let mut req = self.client.get_object().bucket(bucket).key(key);
+        let mut req = client.get_object().bucket(bucket).key(key);
         if range.is_some() {
             req = req.range(range.unwrap().to_str().unwrap());
         }
@@ -171,15 +186,16 @@ impl S3Handler {
             .unwrap())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, client))]
     pub async fn list_objects(
         &self,
+        client: &Client,
         bucket: &str,
         prefix: &str,
         continuation_token: Option<String>,
         start_after: Option<String>,
     ) -> Result<Response<Body>, hyper::Error> {
-        let mut req = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
+        let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
         if continuation_token.is_some() {
             req = req.continuation_token(continuation_token.unwrap());
         }
@@ -187,7 +203,7 @@ impl S3Handler {
             req = req.start_after(start_after.unwrap());
         }
         let res = req.clone().send().await;
-        if let Err(err) = resp {
+        if let Err(err) = res {
             return S3Handler::handle_sdk_error(err);
         }
 

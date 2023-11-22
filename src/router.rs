@@ -7,6 +7,7 @@ use serde_urlencoded;
 use tracing::{info, instrument};
 
 use crate::s3_handler::S3Handler;
+use crate::credentials::Credentials;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -45,50 +46,39 @@ pub async fn route_request(
     // measure the time it takes to handle the request
     let start = std::time::Instant::now();
 
-    let res = match (req.method(), req.uri().path(), query.list_type) {
-        (&Method::GET, "/stream", _) => {
-            use tokio::fs::File;
-            use tokio::io::AsyncWriteExt; // for write_all()
-
-            let (sender, body) = Body::channel();
-
-            // write the current time to sender every second
-            tokio::spawn(async move {
-                let mut f = File::create("test.txt").await.unwrap();
-                let mut sender = sender;
-                let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
-                loop {
-                    interval.tick().await;
-                    info!("sending data");
-                    let chunk = "foobar\n".as_bytes();
-                    match sender.send_data(chunk.into()).await {
-                        Ok(_) => f.write(chunk).await.unwrap(),
-                        Err(e) => {
-                            info!("error sending data: {}", e);
-                            break;
-                        }
-                    };
-                }
-            });
-
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/plain")
-                .body(body)
-                .unwrap())
+    let token = match Credentials::token_from_headers(req.headers()) {
+        Ok(t) => t,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("{}", e)))
+                .unwrap());
         }
+    };
+
+    let client = match s3.get_client(&token).await {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("{}", e)))
+                .unwrap());
+        }
+    };
+
+    let res = match (req.method(), req.uri().path(), query.list_type) {
         (&Method::GET, _, Some(2)) => {
             let prefix = query.prefix.unwrap_or_default();
             let continuation_token = query.continuation_token;
             let start_after = query.start_after;
-            s3.list_objects(bucket, &prefix, continuation_token, start_after)
+            s3.list_objects(&client, bucket, &prefix, continuation_token, start_after)
                 .await
         }
         (&Method::GET, _, _) => {
             let range = req.headers().get("range");
-            s3.get_object(bucket, key, range).await
+            s3.get_object(&client, bucket, key, range).await
         }
-        (&Method::HEAD, _, _) => s3.head_object(bucket, key).await,
+        (&Method::HEAD, _, _) => s3.head_object(&client, bucket, key).await,
         // Handle other routes and methods accordingly.
         _ => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)

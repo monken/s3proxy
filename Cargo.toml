@@ -13,14 +13,15 @@ bytes = "1.1"
 futures-util = "0.3"
 serde = { version = "1.0.192", features = ["derive"] }
 serde_urlencoded = "0.7.1"
-aws-config = "0.57.2"
-aws-types = "0.57.2"
 tokio-util = "0.7.10"
 quick-xml = { version  = "0.31.0", features = ["serialize"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tracing-log = "0.2.0"
 sha2 = "0.10.8"
+reqwest = "0.11.22"
+thiserror = "1.0.50"
+chrono = { version = "0.4.31", features = ["serde"] }
 
 [profile.release]
 strip = true
