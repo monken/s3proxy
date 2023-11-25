@@ -4,24 +4,40 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
+use clap::Parser;
 
 mod router;
 mod s3_handler;
 mod xml_writer;
 mod credentials;
 
+use crate::s3_handler::S3Handler;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// The endpoint to use for S3 requests
+    #[arg(long, short, env)]
+    endpoint: String,
+    #[arg(long, short, default_value="3000", env)]
+    port: u16,
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt().with_env_filter("s3proxy=info,aws_smithy_runtime=error").init();
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let args = Args::parse();
+    info!("{:?}", args);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
 
     let s3 = Arc::new(
-        s3_handler::S3Handler::new()
+        S3Handler::new(&args.endpoint)
             .await
             .expect("Failed to create S3Handler"),
     );
-    let make_svc = make_service_fn(move |_conn| {
+    let make_svc = make_service_fn(|_conn| {
         let s3 = s3.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |req| {

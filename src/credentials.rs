@@ -2,11 +2,26 @@ use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 use hyper::header::{HeaderMap, HeaderValue};
+use quick_xml;
 use serde::Deserialize;
+use serde_json;
 
 use tracing::{info, instrument};
 
 use reqwest;
+
+#[derive(Debug, Deserialize, Clone)]
+struct UserAttributes {
+    #[serde(rename = "multipass:organization-rid")]
+    organization_rid: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct UserInfo {
+    pub username: String,
+    pub id: String,
+    attributes: UserAttributes,
+}
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
@@ -41,6 +56,36 @@ pub enum CredentialsError {
     RequestFailed(#[from] reqwest::Error),
 }
 
+impl UserInfo {
+    pub async fn from_token(token: String) -> Result<UserInfo, CredentialsError> {
+        let client = reqwest::Client::new();
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "Authorization",
+            HeaderValue::from_str(format!("Bearer {}", token).as_str()).unwrap(),
+        );
+        let res = client
+            .get("https://ecosystem.athinia.com/multipass/api/me")
+            .headers(headers)
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            return Err(CredentialsError::RequestFailed(
+                res.error_for_status().unwrap_err(),
+            ));
+        }
+
+        let text = res.text().await?;
+        let res: UserInfo = serde_json::from_str(&text).unwrap();
+        Ok(res)
+    }
+
+    pub fn organization_rid(&self) -> &str {
+        &self.attributes.organization_rid[0]
+    }
+}
+
 impl Credentials {
     #[instrument(skip_all)]
     pub fn token_from_headers(
@@ -61,10 +106,13 @@ impl Credentials {
     }
 
     #[instrument(skip_all)]
-    pub async fn from_token(token: String) -> Result<Credentials, CredentialsError> {
+    pub async fn from_token(
+        endpoint: &str,
+        token: String,
+    ) -> Result<Credentials, CredentialsError> {
         let client = reqwest::Client::new();
         let res = client
-            .post("https://ecosystem.athinia.com/io/s3")
+            .post(endpoint)
             .query(&[
                 ("Action", "AssumeRoleWithWebIdentity"),
                 ("WebIdentityToken", token.as_str()),
@@ -78,9 +126,8 @@ impl Credentials {
             ));
         }
 
-        use quick_xml::de::from_str;
         let text = res.text().await?;
-        let res: AssumeRoleWithWebIdentityResponse = from_str(&text).unwrap();
+        let res: AssumeRoleWithWebIdentityResponse = quick_xml::de::from_str(&text).unwrap();
         Ok(res.assume_role_with_web_identity_result.credentials)
     }
 
@@ -92,48 +139,48 @@ impl Credentials {
 struct CredentialsCacheValue(tokio::sync::watch::Receiver<Option<Credentials>>);
 
 pub struct CredentialsManager {
-    cache: RwLock<std::collections::HashMap<String, Arc<CredentialsCacheValue>>>,
+    endpoint: String,
+    cache: RwLock<std::collections::HashMap<blake3::Hash, Arc<CredentialsCacheValue>>>,
 }
 
 impl CredentialsManager {
-    pub fn new() -> Self {
+    pub fn new(endpoint: &str) -> Self {
         CredentialsManager {
+            endpoint: endpoint.to_string(),
             cache: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
     pub async fn get_credentials(&self, token: String) -> Result<Credentials, CredentialsError> {
-        // TODO: hash token, we don't want to store the raw token in the cache
+        let hash = blake3::hash(token.as_bytes());
         loop {
-            let item = self.cache.read().unwrap().get(&token).cloned();
-            // let token = token.clone();
+            let item = self.cache.read().unwrap().get(&hash).cloned();
             match item {
                 None => {
                     info!("Cache miss for token");
-                    let (sender, receiver) =
-                        tokio::sync::watch::channel(None);
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
                     self.cache
                         .write()
                         .unwrap()
-                        .insert(token.clone(), Arc::new(CredentialsCacheValue(receiver)));
-                    let creds = Credentials::from_token(token).await;
+                        .insert(hash.clone(), Arc::new(CredentialsCacheValue(receiver)));
+                    let creds = Credentials::from_token(&self.endpoint, token).await;
                     match creds {
                         Ok(creds) => {
                             sender.send(Some(creds.clone())).unwrap();
                             return Ok(creds);
-                        },
+                        }
                         Err(e) => return Err(e),
                     };
-                },
+                }
                 Some(item) => {
                     let mut receiver = item.0.clone();
-                    let creds = receiver
-                        .wait_for(|c| c.is_some())
-                        .await;
+                    let creds = receiver.wait_for(|c| c.is_some()).await;
                     match creds {
                         Err(_) => return Err(CredentialsError::CredentialsParse()),
                         Ok(creds) => match creds.clone() {
-                            Some(creds) if { creds.is_expired() } => self.cache.write().unwrap().remove(&token),
+                            Some(creds) if { creds.is_expired() } => {
+                                self.cache.write().unwrap().remove(&hash)
+                            }
                             Some(creds) => return Ok(creds),
                             None => panic!("Should not happen"),
                         },

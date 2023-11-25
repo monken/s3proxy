@@ -24,17 +24,17 @@ pub struct S3Handler {
 }
 
 impl S3Handler {
-    pub async fn new() -> Result<Self, Error> {
+    pub async fn new(endpoint: &str) -> Result<Self, Error> {
         let s3config = Config::builder()
             .region(Region::new("foundry"))
-            .endpoint_url("https://ecosystem.athinia.com/io/s3/")
+            .endpoint_url(endpoint)
             .force_path_style(true)
             .build();
         let size_cache = std::collections::HashMap::new();
         Ok(S3Handler {
             config: s3config,
             size_cache: RwLock::new(size_cache),
-            credentials: CredentialsManager::new(),
+            credentials: CredentialsManager::new(&endpoint),
         })
     }
 
@@ -153,12 +153,10 @@ impl S3Handler {
         let mut file = File::create(format!("data/.{}", fname)).await.unwrap();
         tokio::spawn(async move {
             let mut sender = sender;
-            // let mut obj_body = obj_body;
             loop {
                 let mut buf = BytesMut::with_capacity(16_384);
                 let n = obj_body.read_buf(&mut buf).await.unwrap();
                 let mut buf = buf.freeze();
-                info!("read {} bytes", buf.len());
                 if n == 0 {
                     break;
                 }
@@ -178,6 +176,7 @@ impl S3Handler {
             tokio::fs::rename(format!("data/.{}", fname), format!("data/{}", fname))
                 .await
                 .unwrap();
+
         });
         Ok(Response::builder()
             .status(200)
@@ -194,14 +193,10 @@ impl S3Handler {
         prefix: &str,
         continuation_token: Option<String>,
         start_after: Option<String>,
+        max_keys: Option<i32>,
     ) -> Result<Response<Body>, hyper::Error> {
         let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
-        if continuation_token.is_some() {
-            req = req.continuation_token(continuation_token.unwrap());
-        }
-        if start_after.is_some() {
-            req = req.start_after(start_after.unwrap());
-        }
+        req = req.set_continuation_token(continuation_token).set_start_after(start_after).set_max_keys(max_keys);
         let res = req.clone().send().await;
         if let Err(err) = res {
             return S3Handler::handle_sdk_error(err);

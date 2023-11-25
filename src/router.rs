@@ -6,8 +6,8 @@ use serde_urlencoded;
 
 use tracing::{info, instrument};
 
-use crate::s3_handler::S3Handler;
 use crate::credentials::Credentials;
+use crate::s3_handler::S3Handler;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -16,6 +16,7 @@ struct SearchParameters {
     prefix: Option<String>,
     continuation_token: Option<String>,
     start_after: Option<String>,
+    max_keys: Option<i32>,
 }
 
 #[instrument(skip_all, fields(http.method = req.method().to_string(), http.path = req.uri().path_and_query().unwrap().to_string()))]
@@ -69,10 +70,15 @@ pub async fn route_request(
     let res = match (req.method(), req.uri().path(), query.list_type) {
         (&Method::GET, _, Some(2)) => {
             let prefix = query.prefix.unwrap_or_default();
-            let continuation_token = query.continuation_token;
-            let start_after = query.start_after;
-            s3.list_objects(&client, bucket, &prefix, continuation_token, start_after)
-                .await
+            s3.list_objects(
+                &client,
+                bucket,
+                &prefix,
+                query.continuation_token,
+                query.start_after,
+                query.max_keys,
+            )
+            .await
         }
         (&Method::GET, _, _) => {
             let range = req.headers().get("range");
