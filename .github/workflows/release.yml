@@ -39,10 +39,16 @@ jobs:
           target/
         key: ${{ runner.os }}-${{ github.job }}-target-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Build
-      run: cargo build --verbose
+    # - name: Build
+    #   run: cargo build
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test
+    - name: Build target
+      uses: actions-rs/cargo@v1
+      with:
+        # use-cross: true
+        command: build
+        args: --release --target ${{ matrix.target }}
     - name: Save Cargo cache
       uses: actions/cache/save@v3
       with:
@@ -58,7 +64,7 @@ jobs:
     - name: Upload unofficial packages
       uses: actions/upload-artifact@v3
       with:
-        name: packages
-        path:  ./target/debug/s3proxy
+        name: s3proxy-${{ matrix.target }}
+        path:  ./target/${{ matrix.target }}/release/s3proxy
         retention-days: 3
         if-no-files-found: error
