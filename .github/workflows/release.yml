@@ -13,10 +13,20 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu]
 
     steps:
     - uses: actions/checkout@v3
 
+    - name: Install rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+        target: ${{ matrix.target }}
     - name: Restore Cargo cache
       id: restore-cargo-cache
       uses: actions/cache/restore@v3
@@ -27,7 +37,7 @@ jobs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           target/
-        key: ${{ runner.os }}-${{ github.job }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-${{ github.job }}-target-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build
       run: cargo build --verbose
@@ -35,7 +45,6 @@ jobs:
       run: cargo test --verbose
     - name: Save Cargo cache
       uses: actions/cache/save@v3
-      if: inputs.environment != 'PR integration tests'
       with:
         path: |
           ~/.cargo/bin/
@@ -50,6 +59,6 @@ jobs:
       uses: actions/upload-artifact@v3
       with:
         name: packages
-        path:  ./target/**/s3proxy
+        path:  ./target/debug/s3proxy
         retention-days: 3
         if-no-files-found: error
