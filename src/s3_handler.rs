@@ -1,81 +1,116 @@
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::primitives::SdkBody;
-use aws_sdk_s3::{config::Region, Client, Config, Error};
-use bytes::BytesMut;
 use futures_util::TryFutureExt;
-use http::HeaderValue;
-use hyper::http;
+use hyper::{http, StatusCode};
 use hyper::{Body, Response};
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
 use std::sync::RwLock;
+use std::time::SystemTime;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::try_join;
 use tokio_util::io::ReaderStream;
 use tracing::{info, instrument};
 
 use crate::credentials::{CredentialsError, CredentialsManager};
-use crate::xml_writer::list_bucket_objects_to_xml;
+use crate::xml_writer::ListBucketResult;
 
 pub struct S3Handler {
-    config: Config,
+    // config: Builder,
     credentials: CredentialsManager,
     size_cache: RwLock<std::collections::HashMap<String, i64>>,
+    http_client: reqwest::Client,
+    endpoint: String,
 }
 
 impl S3Handler {
-    pub async fn new(endpoint: &str) -> Result<Self, Error> {
-        let s3config = Config::builder()
-            .region(Region::new("foundry"))
-            .endpoint_url(endpoint)
-            .force_path_style(true)
-            .build();
+    pub fn new(endpoint: &str) -> Self {
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+
         let size_cache = std::collections::HashMap::new();
-        Ok(S3Handler {
-            config: s3config,
+        S3Handler {
+            // config: s3config,
             size_cache: RwLock::new(size_cache),
             credentials: CredentialsManager::new(&endpoint),
-        })
+            http_client: client,
+            endpoint: endpoint.to_string(),
+        }
     }
 
-    pub(crate) fn handle_sdk_error<E>(
-        e: SdkError<E, http::response::Response<SdkBody>>,
-    ) -> Result<Response<Body>, hyper::Error> {
+    pub(crate) fn handle_sdk_error(e: reqwest::Error) -> Result<Response<Body>, hyper::Error> {
         Ok(Response::builder()
-            .status(match e.raw_response() {
-                Some(resp) => resp.status(),
-                None => http::StatusCode::INTERNAL_SERVER_ERROR,
-            })
+            .status(e.status().unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
             .body(Body::from(""))
             .unwrap())
     }
 
-    #[instrument(skip_all)]
-    pub async fn get_client(&self, token: &str) -> Result<Client, CredentialsError> {
-        let credentials = self.credentials.get_credentials(token.to_string()).await?;
-        let aws_credentials = aws_sdk_s3::config::SharedCredentialsProvider::new(
-            aws_sdk_s3::config::Credentials::new(
-                credentials.access_key_id,
-                credentials.secret_access_key,
-                Some(credentials.session_token),
-                None,
-                "PLTR",
-            ),
-        );
-        let client = Client::from_conf(
-            self.config
-                .to_builder()
-                .set_credentials_provider(Some(aws_credentials))
-                .clone()
-                .build(),
-        );
-        Ok(client)
+    pub async fn get_credentials(
+        &self,
+        token: &str,
+    ) -> Result<aws_credential_types::Credentials, CredentialsError> {
+        let credentials = self.credentials.get_credentials(&token).await?;
+        Ok(aws_credential_types::Credentials::new(
+            credentials.access_key_id,
+            credentials.secret_access_key,
+            Some(credentials.session_token),
+            None,
+            "PLTR",
+        ))
     }
 
-    #[instrument(skip(self, client))]
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        credentials: &aws_credential_types::Credentials,
+        uri: &str,
+        headers: Option<Vec<(&str, &str)>>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings};
+        use aws_sigv4::sign::v4;
+        use http::{HeaderName, HeaderValue};
+
+        let signing_settings = SigningSettings::default();
+        let creds = credentials.clone().into();
+
+        let signer = v4::SigningParams::builder()
+            .identity(&creds)
+            .region("foundry")
+            .name("s3")
+            .settings(signing_settings)
+            .time(SystemTime::now())
+            .build()
+            .unwrap();
+        let signable_request = SignableRequest::new(
+            method.as_str(),
+            uri,
+            headers.clone().unwrap_or_default().into_iter(),
+            SignableBody::Bytes(&[]),
+        )
+        .expect("signable request");
+        let signed =
+            aws_sigv4::http_request::sign(signable_request, &signer.into()).expect("sign request");
+        let (x, _) = signed.into_parts();
+        let (signed_headers, _) = x.into_parts();
+        let mut request = reqwest::Request::new(method, reqwest::Url::parse(uri).unwrap());
+        let request_headers = request.headers_mut();
+        for header in headers.clone().unwrap_or_default().into_iter() {
+            request_headers.insert(
+                HeaderName::from_str(header.0).unwrap(),
+                HeaderValue::from_str(header.1).unwrap(),
+            );
+        }
+        for header in signed_headers.into_iter() {
+            request_headers.insert(
+                header.name(),
+                HeaderValue::from_str(header.value()).unwrap(),
+            );
+        }
+        self.http_client.execute(request).await
+    }
+
+    #[instrument(skip(self, credentials))]
     pub async fn head_object(
         &self,
-        client: &Client,
+        credentials: &aws_credential_types::Credentials,
         bucket: &str,
         key: &str,
     ) -> Result<Response<Body>, hyper::Error> {
@@ -92,16 +127,25 @@ impl S3Handler {
                 None => {}
             }
         }
-        let resp = client.head_object().bucket(bucket).key(key).send().await;
+        let uri = format!("{}{}/{}", self.endpoint, bucket, key,);
+        let resp = self
+            .request(reqwest::Method::HEAD, credentials, &uri, None)
+            .await;
         match resp {
             Ok(obj) => {
-                self.size_cache
-                    .write()
+                info!("Got object: {:?}", obj.headers());
+                let cl = obj
+                    .headers()
+                    .get("content-length")
                     .unwrap()
-                    .insert(key.to_string(), obj.content_length);
+                    .to_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap();
+                self.size_cache.write().unwrap().insert(key.to_string(), cl);
                 Ok(Response::builder()
                     .status(200)
-                    .header("content-length", obj.content_length)
+                    .header("content-length", cl)
                     .body(Body::from(""))
                     .unwrap())
             }
@@ -116,20 +160,24 @@ impl S3Handler {
         format!("{:x}", result)
     }
 
-    #[instrument(skip(self, client))]
+    #[instrument(skip(self, credentials))]
     pub async fn get_object(
         &self,
-        client: &Client,
+        credentials: &aws_credential_types::Credentials,
         bucket: &str,
         key: &str,
-        range: Option<&HeaderValue>,
+        range: Option<&http::HeaderValue>,
     ) -> Result<Response<Body>, hyper::Error> {
-        let fname = S3Handler::hash_filename(bucket, key, range.unwrap().to_str().unwrap());
+        let fname = S3Handler::hash_filename(
+            bucket,
+            key,
+            range.map(|r| r.to_str().unwrap()).unwrap_or_default(),
+        );
 
         if let Ok(f) = tokio::fs::metadata(format!("data/{}", fname)).await {
             let file = File::open(format!("data/{}", fname)).await.unwrap();
             let stream = ReaderStream::with_capacity(file, 16_384);
-            let body = hyper::Body::wrap_stream(stream);
+            let body = Body::wrap_stream(stream);
             return Ok(Response::builder()
                 .status(200)
                 .header("content-length", f.len())
@@ -139,36 +187,41 @@ impl S3Handler {
 
         let (sender, body) = hyper::Body::channel();
 
-        let mut req = client.get_object().bucket(bucket).key(key);
-        if range.is_some() {
-            req = req.range(range.unwrap().to_str().unwrap());
-        }
-        let resp = req.send().await;
-        if let Err(err) = resp {
-            return S3Handler::handle_sdk_error(err);
-        }
-        let cl = resp.as_ref().unwrap().content_length;
-        let mut obj_body = resp.unwrap().body.into_async_read();
+        let uri = format!("{}{}/{}", self.endpoint, bucket, key,);
+        let headers = range.map(|r| vec![("range", r.to_str().unwrap())]);
+        let resp = match self
+            .request(reqwest::Method::GET, credentials, &uri, headers)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return S3Handler::handle_sdk_error(e),
+        };
+
+        use futures_util::StreamExt;
+        let cl = resp
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let mut obj_body = resp.bytes_stream();
 
         let mut file = File::create(format!("data/.{}", fname)).await.unwrap();
         tokio::spawn(async move {
             let mut sender = sender;
-            loop {
-                let mut buf = BytesMut::with_capacity(16_384);
-                let n = obj_body.read_buf(&mut buf).await.unwrap();
-                let mut buf = buf.freeze();
-                if n == 0 {
-                    break;
-                }
+            while let Some(buf) = obj_body.next().await {
+                let bytes = buf.unwrap();
 
                 try_join!(
                     sender
-                        .send_data(buf.clone())
+                        .send_data(bytes.clone())
                         .map_err(|_| std::io::Error::new(
                             std::io::ErrorKind::Other,
                             "failed to send data"
                         )),
-                    file.write_all_buf(&mut buf),
+                    file.write(&bytes),
                 )
                 .unwrap();
             }
@@ -176,8 +229,8 @@ impl S3Handler {
             tokio::fs::rename(format!("data/.{}", fname), format!("data/{}", fname))
                 .await
                 .unwrap();
-
         });
+
         Ok(Response::builder()
             .status(200)
             .header("content-length", cl)
@@ -185,40 +238,48 @@ impl S3Handler {
             .unwrap())
     }
 
-    #[instrument(skip(self, client))]
+    #[instrument(skip(self, credentials))]
     pub async fn list_objects(
         &self,
-        client: &Client,
+        credentials: &aws_credential_types::Credentials,
         bucket: &str,
         prefix: &str,
         continuation_token: Option<String>,
         start_after: Option<String>,
         max_keys: Option<i32>,
     ) -> Result<Response<Body>, hyper::Error> {
-        let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
-        req = req.set_continuation_token(continuation_token).set_start_after(start_after).set_max_keys(max_keys);
-        let res = req.clone().send().await;
-        if let Err(err) = res {
+        let uri = format!(
+            "{}{}?list-type=2&prefix={}&continuation-token={}&start-after={}&max-keys={}",
+            self.endpoint,
+            bucket,
+            prefix,
+            continuation_token.unwrap_or_default(),
+            start_after.unwrap_or_default(),
+            max_keys.map(|k| k.to_string()).unwrap_or_default(),
+        );
+        let resp = self
+            .request(reqwest::Method::GET, credentials, &uri, None)
+            .await;
+        if let Err(err) = resp {
             return S3Handler::handle_sdk_error(err);
         }
 
-        {
+        let status = resp.as_ref().unwrap().status();
+        let body = resp.unwrap().text().await.unwrap();
+
+        if status.is_success() {
+            let result = ListBucketResult::from_str(body.as_str()).unwrap();
+
             let mut size_cache = self.size_cache.write().unwrap();
-            res.as_ref().unwrap().contents().iter().for_each(|obj| {
-                size_cache.insert(obj.key.clone().unwrap(), obj.size);
+            result.contents.unwrap_or_default().iter().for_each(|obj| {
+                size_cache.insert(obj.key.clone(), obj.size);
             });
         }
 
-        match list_bucket_objects_to_xml(req.as_input().clone().build().unwrap(), res.unwrap()) {
-            Ok(xml) => Ok(Response::builder()
-                .status(200)
-                .header("content-length", xml.len())
-                .body(Body::from(xml))
-                .unwrap()),
-            Err(_) => Ok(Response::builder()
-                .status(500)
-                .body(Body::from(""))
-                .unwrap()),
-        }
+        Ok(Response::builder()
+            .status(status)
+            .header("content-length", body.len())
+            .body(Body::from(body))
+            .unwrap())
     }
 }

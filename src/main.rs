@@ -3,7 +3,7 @@ use hyper::Server;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, debug};
 use clap::Parser;
 
 mod router;
@@ -25,18 +25,16 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_env_filter("s3proxy=info,aws_smithy_runtime=error").init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     let args = Args::parse();
     info!("{:?}", args);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
 
-    let s3 = Arc::new(
-        S3Handler::new(&args.endpoint)
-            .await
-            .expect("Failed to create S3Handler"),
-    );
+    let s3 = Arc::new(S3Handler::new(&args.endpoint));
     let make_svc = make_service_fn(|_conn| {
         let s3 = s3.clone();
         async move {
@@ -48,7 +46,7 @@ async fn main() {
 
     let server = Server::bind(&addr).serve(make_svc);
 
-    info!("Server running on port 3000");
+    debug!("Server running on port 3000");
     if let Err(e) = server.await {
         eprintln!("server error: {}", e);
     }

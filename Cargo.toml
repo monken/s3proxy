@@ -6,9 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-hyper = "0.14"
+hyper = { version = "0.14", features = ["stream"] }
 tokio = { version = "1", features = ["full"] }
-aws-sdk-s3 = { version = "0.36", features = ["rustls"] }
 bytes = "1.1"
 futures-util = "0.3"
 serde = { version = "1.0.192", features = ["derive"] }
@@ -19,12 +18,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tracing-log = "0.2.0"
 sha2 = "0.10.8"
-reqwest = { version = "0.11.22", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.11.22", default-features = false, features = ["rustls-tls", "stream"] }
 thiserror = "1.0.50"
 chrono = { version = "0.4.31", features = ["serde"] }
 serde_json = "1.0.108"
 clap = { version = "4.4.8", features = ["derive", "env"] }
 blake3 = { version = "1.5.0", features = ["neon"] }
+hyper-rustls = { version = "0.24.2", features = ["webpki-roots"] }
+aws-sigv4 = "1.0.1"
+aws-credential-types = { version = "1.0.1", features = ["hardcoded-credentials"] }
 
 [profile.release]
 strip = true

@@ -57,12 +57,12 @@ pub async fn route_request(
         }
     };
 
-    let client = match s3.get_client(&token).await {
+    let credentials = match s3.get_credentials(&token).await {
         Ok(c) => c,
-        Err(e) => {
+        Err(_) => {
             return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(format!("{}", e)))
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::from("Unauthorized\n"))
                 .unwrap());
         }
     };
@@ -71,7 +71,7 @@ pub async fn route_request(
         (&Method::GET, _, Some(2)) => {
             let prefix = query.prefix.unwrap_or_default();
             s3.list_objects(
-                &client,
+                &credentials,
                 bucket,
                 &prefix,
                 query.continuation_token,
@@ -81,10 +81,10 @@ pub async fn route_request(
             .await
         }
         (&Method::GET, _, _) => {
-            let range = req.headers().get("range");
-            s3.get_object(&client, bucket, key, range).await
+            let range: Option<&HeaderValue> = req.headers().get("range");
+            s3.get_object(&credentials, bucket, key, range).await
         }
-        (&Method::HEAD, _, _) => s3.head_object(&client, bucket, key).await,
+        (&Method::HEAD, _, _) => s3.head_object(&credentials, bucket, key).await,
         // Handle other routes and methods accordingly.
         _ => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)

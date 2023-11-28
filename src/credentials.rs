@@ -108,14 +108,14 @@ impl Credentials {
     #[instrument(skip_all)]
     pub async fn from_token(
         endpoint: &str,
-        token: String,
+        token: &str,
     ) -> Result<Credentials, CredentialsError> {
         let client = reqwest::Client::new();
         let res = client
             .post(endpoint)
             .query(&[
                 ("Action", "AssumeRoleWithWebIdentity"),
-                ("WebIdentityToken", token.as_str()),
+                ("WebIdentityToken", token),
             ])
             .send()
             .await?;
@@ -151,7 +151,7 @@ impl CredentialsManager {
         }
     }
 
-    pub async fn get_credentials(&self, token: String) -> Result<Credentials, CredentialsError> {
+    pub async fn get_credentials(&self, token: &str) -> Result<Credentials, CredentialsError> {
         let hash = blake3::hash(token.as_bytes());
         loop {
             let item = self.cache.read().unwrap().get(&hash).cloned();
