@@ -4,7 +4,7 @@ use hyper::{Body, Response};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use std::sync::RwLock;
-use std::time::SystemTime;
+use std::time::{SystemTime, Duration};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::try_join;
@@ -24,7 +24,7 @@ pub struct S3Handler {
 
 impl S3Handler {
     pub fn new(endpoint: &str) -> Self {
-        let client = reqwest::Client::builder().http1_only().build().unwrap();
+        let client = reqwest::Client::builder().http1_only().tcp_keepalive(Some(Duration::from_secs(60))).build().unwrap();
 
         let size_cache = std::collections::HashMap::new();
         S3Handler {
